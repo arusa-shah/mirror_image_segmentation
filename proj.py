@@ -1,41 +1,39 @@
 import os
-from glob import glob
-
 import cv2
-import matplotlib.pyplot as plt
-import numpy as np  # linear algebra
-import pandas as pd  # data processing, CSV file I/O (e.g. pd.read_csv)
+import numpy as np
 import tensorflow as tf
+import matplotlib.pyplot as plt
+from glob import glob
+from sklearn.metrics import f1_score, classification_report
+from sklearn.model_selection import train_test_split
 
-# Hyperparameters
 H, W = 256, 256
-batch_size = 8  # Adjusted for GPU memory
+batch_size = 8
 num_epochs = 10
 learning_rate = 1e-4
 
 print("Num GPUs Available:", len(tf.config.list_physical_devices('GPU')))
-# Paths to dataset
+
 image_paths = sorted(glob('/kaggle/input/isic2018-challenge-task1-data-segmentation/ISIC2018_Task1-2_Training_Input/*.jpg'))
 mask_paths = sorted(glob('/kaggle/input/isic2018-challenge-task1-data-segmentation/ISIC2018_Task1_Training_GroundTruth/*.png'))
 
-# Verify dataset loading
 print(f"Total images: {len(image_paths)}, Total masks: {len(mask_paths)}")
-# Preprocess images
+
+train_images, val_images, train_masks, val_masks = train_test_split(image_paths, mask_paths, test_size=0.1, random_state=42)
+
 def read_image(image_path):
     image = cv2.imread(image_path, cv2.IMREAD_COLOR)
     image = cv2.resize(image, (W, H))
-    image = image / 255.0  # Normalize to [0, 1]
+    image = image / 255.0
     return image.astype(np.float32)
 
-# Preprocess masks
 def read_mask(mask_path):
     mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
-    mask = cv2.resize(mask, (W, H))
-    mask = mask / 255.0  # Normalize to [0, 1]
-    mask = np.expand_dims(mask, axis=-1)  # Add channel dimension
+    mask = cv2.resize(mask, (W, H), interpolation=cv2.INTER_NEAREST)
+    mask = mask / 255.0
+    mask = np.expand_dims(mask, axis=-1)
     return mask.astype(np.float32)
 
-# TensorFlow dataset parser
 def tf_parse(image_path, mask_path):
     def _parse(image_path, mask_path):
         image = read_image(image_path.decode())
@@ -46,7 +44,6 @@ def tf_parse(image_path, mask_path):
     mask.set_shape([H, W, 1])
     return image, mask
 
-# Create TensorFlow dataset
 def tf_dataset(images, masks, batch):
     dataset = tf.data.Dataset.from_tensor_slices((images, masks))
     dataset = dataset.map(tf_parse, num_parallel_calls=tf.data.AUTOTUNE)
@@ -54,14 +51,8 @@ def tf_dataset(images, masks, batch):
     dataset = dataset.prefetch(tf.data.AUTOTUNE)
     return dataset
 
-# Prepare dataset
-dataset = tf_dataset(image_paths, mask_paths, batch_size)
-print("Dataset ready.")
-
 def build_unet_with_hooks(input_shape):
     inputs = tf.keras.layers.Input(input_shape)
-
-    """Encoder"""
     s1 = tf.keras.layers.Conv2D(64, (3, 3), activation="relu", padding="same", name="conv1_1")(inputs)
     s1 = tf.keras.layers.Conv2D(64, (3, 3), activation="relu", padding="same", name="conv1_2")(s1)
     p1 = tf.keras.layers.MaxPooling2D((2, 2))(s1)
@@ -78,11 +69,9 @@ def build_unet_with_hooks(input_shape):
     s4 = tf.keras.layers.Conv2D(512, (3, 3), activation="relu", padding="same", name="conv4_2")(s4)
     p4 = tf.keras.layers.MaxPooling2D((2, 2))(s4)
 
-    """Bridge"""
     b1 = tf.keras.layers.Conv2D(1024, (3, 3), activation="relu", padding="same", name="bridge1")(p4)
     b1 = tf.keras.layers.Conv2D(1024, (3, 3), activation="relu", padding="same", name="bridge2")(b1)
 
-    """Decoder"""
     d1 = tf.keras.layers.Conv2DTranspose(512, (2, 2), strides=(2, 2), padding="same", name="deconv1")(b1)
     d1 = tf.keras.layers.Concatenate()([d1, s4])
     d1 = tf.keras.layers.Conv2D(512, (3, 3), activation="relu", padding="same", name="deconv1_1")(d1)
@@ -99,224 +88,103 @@ def build_unet_with_hooks(input_shape):
     d4 = tf.keras.layers.Concatenate()([d4, s1])
     d4 = tf.keras.layers.Conv2D(64, (3, 3), activation="relu", padding="same", name="deconv4_1")(d4)
 
-    """Outputs"""
     outputs = tf.keras.layers.Conv2D(1, (1, 1), activation="sigmoid", name="output")(d4)
 
     model = tf.keras.Model(inputs, outputs)
     return model
 
-model = build_unet_with_hooks((H, W, 3))
-model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate),
-                loss="binary_crossentropy", metrics=["accuracy"])
-# Build and compile the model
-model = build_unet((H, W, 3))
-model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate),
-                loss="binary_crossentropy",
-                metrics=["accuracy"])
+train_dataset = tf_dataset(train_images, train_masks, batch_size)
+val_dataset = tf_dataset(val_images, val_masks, batch_size)
 
-# Display model summary
+model = build_unet_with_hooks((H, W, 3))
+model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate), loss="binary_crossentropy", metrics=["accuracy"])
 model.summary()
 
-# Train the model
-history = model.fit(dataset, epochs=num_epochs, steps_per_epoch=len(image_paths) // batch_size)
-for layer in model.layers:
-    print(layer.name)
+history = model.fit(train_dataset, validation_data=val_dataset, epochs=num_epochs)
 
-def compute_cam(model, image, layer_name="conv2d_28"):  # Update with the correct layer name
-    grad_model = tf.keras.models.Model(
-        [model.inputs], [model.get_layer(layer_name).output, model.output]
-    )
+# Plot training curve
+plt.figure(figsize=(12, 5))
+plt.subplot(1, 2, 1)
+plt.plot(history.history['accuracy'], label='Train Accuracy')
+plt.plot(history.history['val_accuracy'], label='Val Accuracy')
+plt.title('Accuracy over Epochs')
+plt.xlabel('Epoch')
+plt.ylabel('Accuracy')
+plt.legend()
 
-    with tf.GradientTape() as tape:
-        conv_outputs, predictions = grad_model(np.expand_dims(image, axis=0))
-        loss = tf.reduce_mean(predictions)
+plt.subplot(1, 2, 2)
+plt.plot(history.history['loss'], label='Train Loss')
+plt.plot(history.history['val_loss'], label='Val Loss')
+plt.title('Loss over Epochs')
+plt.xlabel('Epoch')
+plt.ylabel('Loss')
+plt.legend()
 
-    grads = tape.gradient(loss, conv_outputs)
-    pooled_grads = tf.reduce_mean(grads, axis=(0, 1, 2))
+plt.tight_layout()
+plt.savefig("training_curve.png")
+plt.show()
 
-    conv_outputs = conv_outputs[0]
-    cam = tf.reduce_sum(tf.multiply(pooled_grads, conv_outputs), axis=-1)
-    cam = tf.maximum(cam, 0)
-    cam = cam / tf.reduce_max(cam)
-    return cam.numpy()
-
-
-# Visualize CAM
-def visualize_cam(image_path, model):
-    image = read_image(image_path)
-    cam = compute_cam(model, image)
-    plt.figure(figsize=(10, 5))
-
-    plt.subplot(1, 2, 1)
-    plt.imshow(image)
-    plt.title("Original Image")
-    plt.axis("off")
-
-    plt.subplot(1, 2, 2)
-    plt.imshow(image)
-    plt.imshow(cam, cmap="jet", alpha=0.5)
-    plt.title("CAM Overlay")
-    plt.axis("off")
-
-    plt.show()
-
-# Example Usage
-visualize_cam(image_paths[0], model)
-visualize_cam(image_paths[0], model)
-import matplotlib.pyplot as plt
-import numpy as np
-import tensorflow as tf
-
-
-# Function to calculate relevance maps
-def calculate_lrp(model, image, layer_name="conv2d_26"):
-    """
-    Compute Layer-wise Relevance Propagation (LRP) for the model.
-    Args:
-        model: Trained U-Net model.
-        image: Preprocessed input image (H, W, 3).
-        layer_name: Name of the convolutional layer to use for LRP.
-    Returns:
-        relevance_map: Relevance heatmap.
-    """
-    grad_model = tf.keras.models.Model(
-        [model.input],
-        [model.get_layer(layer_name).output, model.output]
-    )
-
-    # Calculate gradients
-    with tf.GradientTape() as tape:
-        conv_output, predictions = grad_model(np.expand_dims(image, axis=0))
-        target_class = tf.reduce_max(predictions)  # Focus on the maximum prediction
-        grads = tape.gradient(target_class, conv_output)
-    
-    # Compute relevance
-    pooled_grads = tf.reduce_mean(grads, axis=(0, 1, 2))
-    conv_output = conv_output[0]
-    relevance_map = tf.reduce_sum(pooled_grads * conv_output, axis=-1)
-
-    # Normalize for visualization
-    relevance_map = tf.maximum(relevance_map, 0)
-    relevance_map = relevance_map / tf.reduce_max(relevance_map)
-    return relevance_map.numpy()
-
-# Function to visualize relevance maps inline
-def visualize_lrp_inline(image_paths, model, num_images=5):
-    """
-    Display relevance maps for multiple input images inline.
-    Args:
-        image_paths: List of paths to input images.
-        model: Trained U-Net model.
-        num_images: Number of images to process and display.
-    """
-    for i, image_path in enumerate(image_paths[:num_images]):
-        # Preprocess the input image
-        image = read_image(image_path)
-
-        # Calculate relevance map
-        relevance_map = calculate_lrp(model, image)
-
-        # Plot original image and relevance heatmap
-        plt.figure(figsize=(10, 5))
-        plt.subplot(1, 2, 1)
-        plt.imshow(image)
-        plt.title(f"Original Image {i+1}")
-        plt.axis("off")
-
-        plt.subplot(1, 2, 2)
-        plt.imshow(relevance_map, cmap="hot")
-        plt.title(f"Relevance Map {i+1}")
-        plt.axis("off")
-
-        plt.show()
-
-# Example usage
-visualize_lrp_inline(image_paths, model, num_images=5)
-import cv2
-import numpy as np
-from sklearn.metrics import classification_report, f1_score
-
-# Image dimensions
-H, W = 256, 256
-
-# Function to preprocess images
 def preprocess_image(image_path):
-    """
-    Preprocess the input image.
-    Args:
-        image_path: Path to the input image file.
-    Returns:
-        Preprocessed image as a numpy array.
-    """
     img = cv2.imread(image_path, cv2.IMREAD_COLOR)
-    img = cv2.resize(img, (W, H))
-    img = img / 255.0  # Normalize pixel values
+    img = cv2.resize(img, (H, W))
+    img = img / 255.0
     return img.astype(np.float32)
 
-# Function to preprocess masks
 def preprocess_mask(mask_path):
-    """
-    Preprocess the input mask.
-    Args:
-        mask_path: Path to the mask file.
-    Returns:
-        Preprocessed mask as a numpy array.
-    """
     mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
-    mask = cv2.resize(mask, (W, H))
-    mask = mask / 255.0  # Normalize to 0 and 1
-    return (mask > 0.5).astype(np.uint8)  # Binarize mask
+    mask = cv2.resize(mask, (H, W), interpolation=cv2.INTER_NEAREST)
+    mask = mask / 255.0
+    return (mask > 0.5).astype(np.uint8)
 
-# Function to calculate F1 score and generate a report
 def calculate_f1_and_report(model, image_paths, mask_paths, num_samples=10, threshold=0.5):
-    """
-    Calculate F1 score and generate a classification report for the model predictions.
-
-    Args:
-        model: Trained U-Net model.
-        image_paths: List of image file paths.
-        mask_paths: List of mask file paths.
-        num_samples: Number of samples to evaluate.
-        threshold: Threshold for converting predicted probabilities to binary.
-
-    Returns:
-        f1: F1 score.
-        report: Classification report as a string.
-    """
-    y_true = []
-    y_pred = []
-
+    y_true, y_pred = [], []
     for i, (image_path, mask_path) in enumerate(zip(image_paths[:num_samples], mask_paths[:num_samples])):
-        # Preprocess image and mask
         img = preprocess_image(image_path)
         mask = preprocess_mask(mask_path)
-
-        # Predict mask
         predicted_mask = model.predict(np.expand_dims(img, axis=0))[0]
-
-        # Flatten ground truth and predictions
         y_true.append(mask.flatten())
-        y_pred.append((predicted_mask.flatten() > threshold).astype(int))  # Apply threshold to binarize
-
-    # Convert to numpy arrays
+        y_pred.append((predicted_mask.flatten() > threshold).astype(int))
     y_true = np.concatenate(y_true)
     y_pred = np.concatenate(y_pred)
-
-    # Calculate F1 score
     f1 = f1_score(y_true, y_pred, zero_division=1)
-
-    # Generate classification report
     report = classification_report(y_true, y_pred, zero_division=1)
-
     return f1, report
 
-# Calculate F1 score and report
-f1_score_value, f1_report = calculate_f1_and_report(model, image_paths, mask_paths)
+f1_score_value, f1_report = calculate_f1_and_report(model, val_images, val_masks)
 
-# Save the report to a file
 with open("f1_report.txt", "w") as f:
     f.write(f"F1 Score: {f1_score_value}\n\n")
     f.write(f1_report)
 
 print(f"F1 Score: {f1_score_value}")
 print(f"Classification Report:\n{f1_report}")
+
+
+def visualize_predictions(model, image_paths, mask_paths, num_samples=5):
+    for i in range(num_samples):
+        image = preprocess_image(image_paths[i])
+        mask = preprocess_mask(mask_paths[i])
+        pred = model.predict(np.expand_dims(image, axis=0))[0, :, :, 0]
+        pred = (pred > 0.5).astype(np.uint8)
+
+        plt.figure(figsize=(12, 4))
+        plt.subplot(1, 3, 1)
+        plt.imshow(image)
+        plt.title("Original Image")
+        plt.axis("off")
+
+        plt.subplot(1, 3, 2)
+        plt.imshow(mask, cmap="gray")
+        plt.title("Ground Truth")
+        plt.axis("off")
+
+        plt.subplot(1, 3, 3)
+        plt.imshow(pred, cmap="gray")
+        plt.title("Predicted Mask")
+        plt.axis("off")
+
+        plt.tight_layout()
+        plt.savefig(f"prediction_{i+1}.png")
+        plt.show()
+
+visualize_predictions(model, val_images, val_masks)
